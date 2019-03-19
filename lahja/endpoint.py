@@ -1,10 +1,15 @@
 import asyncio
 import functools
+import itertools
 import logging
+import multiprocessing
 from multiprocessing.managers import (  # type: ignore # Typeshed definition is lacking `BaseProxy`
     BaseManager,
     BaseProxy,
+    ConditionProxy,
+    RemoteError,
 )
+import multiprocessing.util
 import pathlib
 import pickle
 import threading
@@ -13,7 +18,6 @@ from typing import (  # noqa: F401
     AsyncGenerator,
     Callable,
     Dict,
-    Iterable,
     List,
     NamedTuple,
     Optional,
@@ -83,6 +87,9 @@ class EndpointConnector:
         # won't pick it up until some other task moves the loop forward
         loop.call_soon_threadsafe(self._endpoint._receiving_queue.put_nowait, item_and_config)
 
+    def subscribed_events(self) -> Set[Type[BaseEvent]]:
+        return self._endpoint.subscribed_events
+
 
 class ProxyEndpointConnector(BaseProxy):  # type: ignore # TypeShed is missing BaseProxy
     """
@@ -91,6 +98,49 @@ class ProxyEndpointConnector(BaseProxy):  # type: ignore # TypeShed is missing B
 
     def put_nowait(self, item_and_config: Tuple[BaseEvent, Optional[BroadcastConfig]]) -> None:
         self._callmethod('put_nowait', (item_and_config,))
+
+    def subscribed_events(self) -> Set[Type[BaseEvent]]:
+        return cast(Set[Type[BaseEvent]], self._callmethod('subscribed_events'))
+
+
+class ConnectorFilter:
+    """
+    Filter out messages the remote endpoint doesn't want to receive
+    """
+
+    def __init__(self,
+                 proxy: ProxyEndpointConnector,
+                 condition: ConditionProxy) -> None:
+        self.proxy = proxy
+        self.condition = condition
+        self.allowed_events: Set[Type[BaseEvent]] = proxy.subscribed_events()
+
+    def start(self) -> None:
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self) -> None:
+        try:
+            while True:
+                with self.condition:
+                    self.update_subscription()
+                    self.condition.wait()
+        except (EOFError, BrokenPipeError, ConnectionResetError, RemoteError):
+            # Often the multiproxessing server shuts down before this thread does, leading
+            # to exceptions when we try to call methods on our ConditionProxy.
+            if not multiprocessing.util.is_exiting():
+                raise
+
+    def update_subscription(self) -> None:
+        self.allowed_events = self.proxy.subscribed_events()
+
+    def put_nowait(self, item_and_config: Tuple[BaseEvent, Optional[BroadcastConfig]]) -> None:
+        item, config = item_and_config
+        is_response = config is not None and config.filter_event_id
+        if type(item) in self.allowed_events or is_response:
+            self.proxy.put_nowait(item_and_config)
+
+
+Self = TypeVar('Self')
 
 
 class Endpoint:
@@ -119,7 +169,15 @@ class Endpoint:
         self._handler: Dict[Type[BaseEvent], List[Callable[[BaseEvent], Any]]] = {}
         self._queues: Dict[Type[BaseEvent], List[asyncio.Queue]] = {}
 
+        self._subscriptions_changed = multiprocessing.Condition()
+
         self._running = False
+
+    def __enter__(self: Self) -> Self:
+        return self
+
+    def __exit__(self, exc_type=None, exc_value=None, exc_tb=None) -> None:  # type: ignore
+        self.stop()
 
     @property
     def ipc_path(self) -> pathlib.Path:
@@ -153,6 +211,15 @@ class Endpoint:
                 self._has_snappy_support = False
 
         return self._has_snappy_support
+
+    @property
+    def subscribed_events(self) -> Set[Type[BaseEvent]]:
+        "Return the set of events this Endpoint is currently listening for"
+        return set(self._handler.keys()) | set(self._queues.keys())
+
+    def _notify_subscriptions_changed(self) -> None:
+        with self._subscriptions_changed:
+            self._subscriptions_changed.notify_all()
 
     def start_serving_nowait(self,
                              connection_config: ConnectionConfig,
@@ -248,13 +315,14 @@ class Endpoint:
             self._process_item(item, config)
 
     def _create_external_api(self, ipc_path: pathlib.Path) -> None:
-
+        condition = self._subscriptions_changed
         receiver = EndpointConnector(self)
 
         class ConnectorManager(BaseManager):
             pass
 
         ConnectorManager.register('get_connector', callable=lambda: receiver)  # type: ignore
+        ConnectorManager.register('Condition', callable=lambda: condition)  # type: ignore
 
         manager = ConnectorManager(address=str(ipc_path))  # type: ignore
         server = manager.get_server()   # type: ignore
@@ -309,10 +377,18 @@ class Endpoint:
             'get_connector',
             proxytype=ProxyEndpointConnector
         )
+        ConnectorManager.register('Condition', proxytype=ConditionProxy)  # type: ignore
 
         manager = ConnectorManager(address=str(endpoint.path))  # type: ignore
         manager.connect()
-        self._connected_endpoints[endpoint.name] = manager.get_connector()  # type: ignore
+
+        connector_filter = ConnectorFilter(
+            manager.get_connector(),  # type: ignore
+            manager.Condition(),  # type: ignore
+        )
+        connector_filter.start()
+
+        self._connected_endpoints[endpoint.name] = connector_filter
 
     def is_connected_to(self, endpoint_name: str) -> bool:
         return endpoint_name in self._connected_endpoints
@@ -430,8 +506,13 @@ class Endpoint:
         casted_handler = cast(Callable[[BaseEvent], Any], handler)
 
         self._handler[event_type].append(casted_handler)
+        self._notify_subscriptions_changed()
 
-        return Subscription(lambda: self._handler[event_type].remove(casted_handler))
+        def remove() -> None:
+            self._handler[event_type].remove(casted_handler)
+            self._notify_subscriptions_changed()
+
+        return Subscription(remove)
 
     TStreamEvent = TypeVar('TStreamEvent', bound=BaseEvent)
 
@@ -450,25 +531,25 @@ class Endpoint:
             self._queues[event_type] = []
 
         self._queues[event_type].append(queue)
-        i = None if num_events is None else 0
-        while True:
-            try:
-                yield await queue.get()
-            except GeneratorExit:
-                self._queues[event_type].remove(queue)
-                break
-            except asyncio.CancelledError:
-                self._queues[event_type].remove(queue)
-                break
-            else:
-                if i is None:
-                    continue
+        self._notify_subscriptions_changed()
 
-                i += 1
+        if num_events is None:
+            # loop forever
+            iterations = itertools.repeat(True)
+        else:
+            iterations = itertools.repeat(True, num_events)
 
-                if i >= cast(int, num_events):
-                    self._queues[event_type].remove(queue)
+        try:
+            for _ in iterations:
+                try:
+                    yield await queue.get()
+                except GeneratorExit:
                     break
+                except asyncio.CancelledError:
+                    break
+        finally:
+            self._queues[event_type].remove(queue)
+            self._notify_subscriptions_changed()
 
     TWaitForEvent = TypeVar('TWaitForEvent', bound=BaseEvent)
 

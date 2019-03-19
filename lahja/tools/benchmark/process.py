@@ -60,6 +60,7 @@ class DriverProcess:
         event_bus = Endpoint()
         event_bus.start_serving_nowait(ConnectionConfig.from_name(DRIVER_ENDPOINT))
         event_bus.connect_to_endpoints_blocking(*config.connected_endpoints)
+
         # UNCOMMENT FOR DEBUGGING
         # logger = multiprocessing.log_to_stderr()
         # logger.setLevel(logging.INFO)

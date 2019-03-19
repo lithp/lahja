@@ -8,6 +8,7 @@ from helpers import (
     DummyRequestPair,
     DummyResponse,
     Tracker,
+    propogate_subscriptions,
 )
 from lahja import (
     BroadcastConfig,
@@ -32,6 +33,8 @@ async def test_broadcasts_to_all_endpoints(
         DummyRequestPair,
         tracker.track_and_broadcast_dummy(2, endpoint2)
     )
+
+    propogate_subscriptions(endpoint1, endpoint2, endpoint3)
 
     item = DummyRequestPair()
     response = await endpoint3.request(item)
@@ -60,6 +63,8 @@ async def test_broadcasts_to_specific_endpoint(
         DummyRequestPair,
         tracker.track_and_broadcast_dummy(2, endpoint1)
     )
+
+    propogate_subscriptions(endpoint1, endpoint2, endpoint3)
 
     item = DummyRequestPair()
     response = await endpoint3.request(item, BroadcastConfig(filter_endpoint=endpoint1.name))

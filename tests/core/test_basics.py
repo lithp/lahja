@@ -6,6 +6,7 @@ from helpers import (
     DummyRequest,
     DummyRequestPair,
     DummyResponse,
+    propogate_subscriptions,
 )
 from lahja import (
     Endpoint,
@@ -23,6 +24,8 @@ async def test_request(endpoint: Endpoint) -> None:
             DummyResponse(ev.property_of_dummy_request_pair), ev.broadcast_config()
         )
     )
+
+    propogate_subscriptions(endpoint)
 
     item = DummyRequestPair()
     response = await endpoint.request(item)
@@ -56,6 +59,8 @@ async def test_response_must_match(endpoint: Endpoint) -> None:
         )
     )
 
+    propogate_subscriptions(endpoint)
+
     with pytest.raises(UnexpectedResponse):
         await endpoint.request(DummyRequestPair())
 
@@ -76,6 +81,9 @@ async def test_stream_with_break(endpoint: Endpoint) -> None:
                 break
 
     asyncio.ensure_future(stream_response())
+    await asyncio.sleep(0)  # give the future a chance to subscribe
+
+    propogate_subscriptions(endpoint)
 
     # we broadcast one more item than what we consume and test for that
     for i in range(5):
@@ -100,6 +108,9 @@ async def test_stream_with_num_events(endpoint: Endpoint) -> None:
             stream_counter += 1
 
     asyncio.ensure_future(stream_response())
+    await asyncio.sleep(0)  # give the future a chance to be scheduled
+
+    propogate_subscriptions(endpoint)
 
     # we broadcast one more item than what we consume and test for that
     for i in range(3):
@@ -134,6 +145,9 @@ async def test_stream_can_get_cancelled(endpoint: Endpoint) -> None:
 
     asyncio.ensure_future(stream_response())
     asyncio.ensure_future(cancel_soon())
+    await asyncio.sleep(0)  # give the above futures a chance to run
+
+    propogate_subscriptions(endpoint)
 
     for i in range(50):
         endpoint.broadcast(DummyRequest())
@@ -167,6 +181,9 @@ async def test_stream_cancels_when_parent_task_is_cancelled(endpoint: Endpoint) 
                 break
 
     asyncio.ensure_future(cancel_soon())
+    await asyncio.sleep(0)  # give the above futures a chance to run
+
+    propogate_subscriptions(endpoint)
 
     for i in range(10):
         endpoint.broadcast(DummyRequest())
@@ -190,6 +207,10 @@ async def test_wait_for(endpoint: Endpoint) -> None:
         received = request
 
     asyncio.ensure_future(stream_response())
+    await asyncio.sleep(0)  # give stream_response a chance to subscribe
+
+    propogate_subscriptions(endpoint)
+
     endpoint.broadcast(DummyRequest())
 
     await asyncio.sleep(0.01)

@@ -15,6 +15,12 @@ from lahja import (
 )
 
 
+def propogate_subscriptions(*endpoints: Endpoint) -> None:
+    for endpoint in endpoints:
+        for connector_filter in endpoint._connected_endpoints.values():
+            connector_filter.update_subscription()
+
+
 class DummyRequest(BaseEvent):
     property_of_dummy_request = None
 
