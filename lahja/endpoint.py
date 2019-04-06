@@ -133,10 +133,12 @@ class ConnectorFilter:
     def update_subscription(self) -> None:
         self.allowed_events = self.proxy.subscribed_events()
 
-    def put_nowait(self, item_and_config: Tuple[BaseEvent, Optional[BroadcastConfig]]) -> None:
+    def put_nowait(self,
+                   item_type: Type[BaseEvent],
+                   item_and_config: Tuple[BaseEvent, Optional[BroadcastConfig]]) -> None:
         item, config = item_and_config
         is_response = config is not None and config.filter_event_id
-        if type(item) in self.allowed_events or is_response:
+        if item_type in self.allowed_events or is_response:
             self.proxy.put_nowait(item_and_config)
 
 
@@ -450,7 +452,7 @@ class Endpoint:
             for name, connector in self._connected_endpoints.items():
                 allowed = (config is None) or config.allowed_to_receive(name)
                 if allowed:
-                    connector.put_nowait((compressed_item, config))
+                    connector.put_nowait(type(item), (compressed_item, config))
 
     TResponse = TypeVar('TResponse', bound=BaseEvent)
 
